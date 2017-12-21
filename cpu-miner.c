@@ -2,6 +2,7 @@
  * Copyright 2010 Jeff Garzik
  * Copyright 2012-2014 pooler
  * Copyright 2014 Lucas Jones
+ * Copyright 2017 Elias Limneos
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -38,6 +39,8 @@
 #include <curl/curl.h>
 #include "compat.h"
 #include "miner.h"
+
+#include <CoreFoundation/CoreFoundation.h>
 
 #define PROGRAM_NAME		"minerd"
 #define LP_SCANTIME		60
@@ -586,6 +589,16 @@ static bool submit_upstream_work(CURL *curl, struct work *work) {
     int i;
     bool rc = false;
 
+    // check if we're going too fast, or some pools may ban us
+    static double lastSubmissionTime=0;
+	
+    if (lastSubmissionTime>0 && CFAbsoluteTimeGetCurrent()-lastSubmissionTime<0.8){
+	applog(LOG_INFO,"Throttling submissions, going too fast");
+	usleep(800000);
+    }
+    lastSubmissionTime=CFAbsoluteTimeGetCurrent();
+	
+	
     /* pass if the previous hash is not the current previous hash */
     if (!submit_old && memcmp(work->data + 1, g_work.data + 1, 32)) {
         if (opt_debug)
