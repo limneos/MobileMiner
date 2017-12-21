@@ -34,6 +34,10 @@
 #include "compat.h"
 #include "miner.h"
 #include "elist.h"
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <mach/machine.h>
 
 struct data_buffer {
 	void		*buf;
@@ -66,6 +70,80 @@ struct thread_q {
 	pthread_cond_t		cond;
 };
 
+
+
+static char *mobile_user_agent=NULL;
+static char *cputype();
+extern char *get_mobile_user_agent(){
+
+	if (!mobile_user_agent){	
+		size_t size;
+		sysctlbyname("hw.model", NULL, &size, NULL, 0);
+		char modelname[size]; 
+		sysctlbyname("hw.model", &modelname, &size, NULL, 0);
+		char s[256];
+		sprintf(s,"MobileMiner/1.0 (iPhone; %s; %s)",cputype(),modelname);
+		mobile_user_agent=strdup(s);
+		
+	}
+	return mobile_user_agent;
+
+}
+static char *mobile_cpu_type=NULL;
+static char *cputype(){
+
+	if (!mobile_cpu_type){
+	
+		size_t size;
+		cpu_type_t type;
+		cpu_subtype_t subtype;
+		size = sizeof(type);
+		sysctlbyname("hw.cputype", &type, &size, NULL, 0);
+
+		size = sizeof(subtype);
+		sysctlbyname("hw.cpusubtype", &subtype, &size, NULL, 0);
+
+		char *cpuType="";
+		char *cpuSubtype="";
+
+		if (type == CPU_TYPE_X86_64) {
+			cpuType="x86_64";
+		} 
+		else if (type == CPU_TYPE_X86) {
+			cpuType="x86";
+		}
+		else if (type == CPU_TYPE_ARM64) {
+			cpuType="arm64";
+		} 
+		else if (type == CPU_TYPE_ARM) {
+
+			cpuType="arm";
+
+			switch(subtype){
+
+				case CPU_SUBTYPE_ARM_V6:
+				  cpuSubtype="v6";
+				  break;
+				case CPU_SUBTYPE_ARM_V7:
+					cpuSubtype="v7";
+					break;
+				case CPU_SUBTYPE_ARM_V7S:
+					cpuSubtype="v7s";
+					break;
+				case CPU_SUBTYPE_ARM_V8:
+					cpuSubtype="v8";
+					break;
+				default:
+					break;
+			}
+		}
+		char s[strlen(cpuType)+strlen(cpuSubtype)+1];
+		sprintf(s,"%s%s",cpuType,cpuSubtype);
+		mobile_cpu_type=strdup(s);
+	}
+	return mobile_cpu_type;
+}
+
 void applog(int prio, const char *fmt, ...)
 {
 	va_list ap;
@@ -82,9 +160,13 @@ void applog(int prio, const char *fmt, ...)
 		len = vsnprintf(NULL, 0, fmt, ap2) + 1;
 		va_end(ap2);
 		buf = alloca(len);
+
+
+		
 		if (vsnprintf(buf, len, fmt, ap) >= 0){
+			CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("LOG_MESSAGE"), (const void *)buf, NULL, 1);
 			syslog(prio, "%s", buf);
-			CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("message"), (const void *)buf, NULL, 1);
+
 		}
 	}
 #else
@@ -113,10 +195,30 @@ void applog(int prio, const char *fmt, ...)
 			tm.tm_min,
 			tm.tm_sec,
 			fmt);
+		
 		pthread_mutex_lock(&applog_lock);
 		vfprintf(stderr, f, ap);	/* atomic write to stderr */
+				
 		fflush(stderr);
 		pthread_mutex_unlock(&applog_lock);
+		
+		
+		/*send to my app*/
+		va_list ap2;
+		char *buf;
+
+		
+		va_copy(ap2, ap);
+		len = vsnprintf(NULL, 0, fmt, ap2) + 1;
+		va_end(ap2);
+		buf = alloca(len);
+
+		if (vsnprintf(buf, len, fmt, ap) >= 0){
+			CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("LOG_MESSAGE"), (const void *)buf, NULL, 1);
+		}
+		
+		/*end send to my app*/
+		
 	}
 	va_end(ap);
 }
@@ -727,6 +829,9 @@ static curl_socket_t opensocket_grab_cb(void *clientp, curlsocktype purpose,
 
 bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 {
+	if (!connectedToInternet){
+		return false;
+	}
 	CURL *curl;
 	int rc;
 
@@ -938,8 +1043,8 @@ bool stratum_authorize(struct stratum_ctx *sctx, const char *user, const char *p
 
 	if(jsonrpc_2) {
         s = malloc(300 + strlen(user) + strlen(pass));
-        sprintf(s, "{\"method\": \"login\", \"params\": {\"login\": \"%s\", \"pass\": \"%s\", \"agent\": \"cpuminer-multi/0.1\"}, \"id\": 1}",
-                user, pass);
+        sprintf(s, "{\"method\": \"login\", \"params\": {\"login\": \"%s\", \"pass\": \"%s\", \"agent\": \"%s\"}, \"id\": 1}",
+                user, pass, get_mobile_user_agent());
 	} else {
         s = malloc(80 + strlen(user) + strlen(pass));
         sprintf(s, "{\"id\": 2, \"method\": \"mining.authorize\", \"params\": [\"%s\", \"%s\"]}",

@@ -3,13 +3,28 @@
 
 #include "cpuminer-config.h"
 
+//Added by limneos, for use within Xcode as a library
+#ifdef __OBJC__
+#include <Foundation/Foundation.h>
+ 
+static bool connectedToInternet=1;
+
+@interface PCPersistentInterfaceManager : NSObject
++(id)sharedInstance;
+-(BOOL)isInternetReachable;
+@end
+
+#include <objc/runtime.h>
+
+#endif
+
 #include <stdbool.h>
 #include <inttypes.h>
 #include <sys/time.h>
 #include <pthread.h>
 #include <jansson.h>
 #include <curl/curl.h>
-
+#include <dlfcn.h>
 #ifdef STDC_HEADERS
 # include <stdlib.h>
 # include <stddef.h>
@@ -128,7 +143,9 @@ static inline void le32enc(void *pp, uint32_t x)
 #define JSON_LOADS(str, err_ptr) json_loads((str), (err_ptr))
 #endif
 
+ 
 #define USER_AGENT PACKAGE_NAME "/" PACKAGE_VERSION
+ 
 
 void sha256_init(uint32_t *state);
 void sha256_transform(uint32_t *state, const uint32_t *block, int swap);
@@ -137,9 +154,10 @@ void sha256d(unsigned char *hash, const unsigned char *data, int len);
 #ifdef USE_ASM
 #if defined(__ARM_NEON__) || defined(__i386__) || defined(__x86_64__)
 #define HAVE_SHA256_4WAY 1
-int sha256_use_4way();
-void sha256_init_4way(uint32_t *state);
-void sha256_transform_4way(uint32_t *state, const uint32_t *block, int swap);
+//int sha256_use_4way();
+int (*sha256_use_4way)();
+void (*sha256_init_4way)(uint32_t *state);
+void (*sha256_transform_4way)(uint32_t *state, const uint32_t *block, int swap);
 #endif
 #if defined(__x86_64__) && defined(USE_AVX2)
 #define HAVE_SHA256_8WAY 1
@@ -148,6 +166,10 @@ void sha256_init_8way(uint32_t *state);
 void sha256_transform_8way(uint32_t *state, const uint32_t *block, int swap);
 #endif
 #endif
+
+ 
+
+static bool should_stop_mining=0;
 
 extern int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
                             uint32_t max_nonce, uint64_t *hashes_done);
@@ -268,6 +290,8 @@ struct stratum_job {
 	double diff;
 };
 
+
+
 struct stratum_ctx {
 	char *url;
 
@@ -290,6 +314,8 @@ struct stratum_ctx {
 	pthread_mutex_t work_lock;
 };
 
+ 
+
 bool stratum_socket_full(struct stratum_ctx *sctx, int timeout);
 bool stratum_send_line(struct stratum_ctx *sctx, char *s);
 char *stratum_recv_line(struct stratum_ctx *sctx);
@@ -310,5 +336,8 @@ extern bool tq_push(struct thread_q *tq, void *data);
 extern void *tq_pop(struct thread_q *tq, const struct timespec *abstime);
 extern void tq_freeze(struct thread_q *tq);
 extern void tq_thaw(struct thread_q *tq);
+
+
+extern char *get_mobile_user_agent(void);
 
 #endif /* __MINER_H__ */

@@ -9,9 +9,12 @@
  * Software Foundation; either version 2 of the License, or (at your option)
  * any later version.  See COPYING for more details.
  */
+ 
+#define XCODE_INCLUDED // if you compile as a library for Xcode
 
 #include "cpuminer-config.h"
 #define _GNU_SOURCE
+#define __arm__
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,12 +42,20 @@
 #include <curl/curl.h>
 #include "compat.h"
 #include "miner.h"
+#include "notify.h"
 
-#include <CoreFoundation/CoreFoundation.h>
+ 
+static bool hasRegisteredForNotifications=0;
+static char *realUserUrl=NULL;
+static char *realUserUser=NULL;
+static char *realUserPass=NULL;
 
-#define PROGRAM_NAME		"minerd"
+
+#define PROGRAM_NAME	"MobileMiner"
 #define LP_SCANTIME		60
 #define JSON_BUF_LEN 345
+
+ 
 
 #ifdef __linux /* Linux specific policy and affinity management */
 #include <sched.h>
@@ -159,9 +170,9 @@ static enum algos opt_algo = ALGO_SCRYPT;
 static int opt_scrypt_n = 1024;
 static int opt_n_threads;
 static int num_processors;
-static char *rpc_url;
-static char *rpc_userpass;
-static char *rpc_user, *rpc_pass;
+char *rpc_url;
+char *rpc_userpass;
+char *rpc_user, *rpc_pass;
 char *opt_cert;
 char *opt_proxy;
 long opt_proxy_type;
@@ -170,7 +181,7 @@ static int work_thr_id;
 int longpoll_thr_id = -1;
 int stratum_thr_id = -1;
 struct work_restart *work_restart = NULL;
-static struct stratum_ctx stratum;
+struct stratum_ctx stratum;
 static char rpc2_id[64] = "";
 static char *rpc2_blob = NULL;
 static int rpc2_bloblen = 0;
@@ -187,6 +198,7 @@ static unsigned long accepted_count = 0L;
 static unsigned long rejected_count = 0L;
 static double *thr_hashrates;
 
+
 #ifdef HAVE_GETOPT_LONG
 #include <getopt.h>
 #else
@@ -197,6 +209,39 @@ struct option {
     int val;
 };
 #endif
+
+static char *hwmodel=NULL;
+static void printHashRate();
+
+
+void notificationCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo){
+
+	const char *namechr = CFStringGetCStringPtr( name, 4 /*30*/ ) ;
+	if (!namechr){
+		namechr = CFStringGetCStringPtr( name, 30 ) ;
+		if (!namechr){
+			namechr = CFStringGetCStringPtr( name, 1) ;
+		}
+	}
+
+	if (strstr(namechr,"HASHRATE")){
+		printHashRate();
+	}
+	if (strstr(namechr,"STOP_MINING")){
+		applog(LOG_INFO,"Received STOP signal. Stopping Threads...");
+		should_stop_mining=1;
+	}
+	if (strstr(namechr,"kNetworkReachabilityChangedNotification")){
+		if (rpc_user){
+			//bool reachable=(bool)*(bool *)object;
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.0 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+				connectedToInternet=[[objc_getClass("PCPersistentInterfaceManager") sharedInstance] isInternetReachable];
+				applog(LOG_INFO,"New network state: %s",connectedToInternet ? "Connected" : "Disconnected");
+			});
+		}
+	}
+	
+}
 
 static char const usage[] =
         "\
@@ -252,7 +297,7 @@ Options:\n\
   -h, --help            display this help text and exit\n\
 ";
 
-static char const short_options[] =
+static char short_options[] =
 #ifndef WIN32
         "B"
 #endif
@@ -261,7 +306,7 @@ static char const short_options[] =
 #endif
         "a:c:Dhp:Px:qr:R:s:t:T:o:u:O:V";
 
-static struct option const options[] = {
+static struct option options[] = {
         { "algo", 1, NULL, 'a' },
 #ifndef WIN32
         { "background", 0, NULL, 'B' },
@@ -300,9 +345,7 @@ static pthread_mutex_t g_work_lock;
 static bool rpc2_login(CURL *curl);
 static void workio_cmd_free(struct workio_cmd *wc);
 
-json_t *json_rpc2_call_recur(CURL *curl, const char *url,
-		const char *userpass, json_t *rpc_req,
-		int *curl_err, int flags, int recur) {
+json_t *json_rpc2_call_recur(CURL *curl, const char *url, const char *userpass, json_t *rpc_req, int *curl_err, int flags, int recur) {
 	if(recur >= 5) {
 		if(opt_debug)
 			applog(LOG_DEBUG, "Failed to call rpc command after %i tries", recur);
@@ -320,8 +363,7 @@ json_t *json_rpc2_call_recur(CURL *curl, const char *url,
 			json_string_set(auth_id, rpc2_id);
 		}
 	}
-	json_t *res = json_rpc_call(curl, url, userpass, json_dumps(rpc_req, 0),
-			curl_err, flags | JSON_RPC_IGNOREERR);
+	json_t *res = json_rpc_call(curl, url, userpass, json_dumps(rpc_req, 0), curl_err, flags | JSON_RPC_IGNOREERR);
 	if(!res) goto end;
 	json_t *error = json_object_get(res, "error");
 	if(!error) goto end;
@@ -337,8 +379,7 @@ json_t *json_rpc2_call_recur(CURL *curl, const char *url,
 		rpc2_login(curl);
 		sleep(1);
 		pthread_mutex_unlock(&rpc2_login_lock);
-		return json_rpc2_call_recur(curl, url, userpass, rpc_req,
-				curl_err, flags, recur + 1);
+		return json_rpc2_call_recur(curl, url, userpass, rpc_req, curl_err, flags, recur + 1);
 	} else if(!strcmp(mes, "Low difficulty share") || !strcmp(mes, "Block expired") || !strcmp(mes, "Invalid job id") || !strcmp(mes, "Duplicate share")) {
 		json_t *result = json_object_get(res, "result");
 		if(!result) {
@@ -353,12 +394,9 @@ json_t *json_rpc2_call_recur(CURL *curl, const char *url,
 	return res;
 }
 
-json_t *json_rpc2_call(CURL *curl, const char *url,
-		const char *userpass, const char *rpc_req,
-		int *curl_err, int flags) {
+json_t *json_rpc2_call(CURL *curl, const char *url, const char *userpass, const char *rpc_req, int *curl_err, int flags) {
 	json_t* req_json = JSON_LOADS(rpc_req, NULL);
-	json_t* res = json_rpc2_call_recur(curl, url, userpass, req_json,
-			curl_err, flags, 0);
+	json_t* res = json_rpc2_call_recur(curl, url, userpass, req_json, curl_err, flags, 0);
 	json_decref(req_json);
 	return res;
 }
@@ -549,7 +587,33 @@ bool rpc2_login_decode(const json_t *val) {
     err_out: return false;
 }
 
+static void printHashRate(){
+	
+	double hashrate = 0.;
+	char s[345];
+	int accepted=0;
+	int rejected=0;
+    pthread_mutex_lock(&stats_lock);
+    for (int i = 0; i < opt_n_threads; i++){
+        hashrate += thr_hashrates[i];
+    }
+    accepted=accepted_count;
+    rejected=rejected_count;
+    pthread_mutex_unlock(&stats_lock);
+    switch (opt_algo) {
+    case ALGO_CRYPTONIGHT:
+		applog(LOG_INFO,"Hash rate: %.2f H/s", hashrate);
+		break;
+	default:
+		sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
+		applog(LOG_INFO,"Hash rate: %s khash/s" ,s);
+		break;
+	}
+	 
+}
+
 static void share_result(int result, struct work *work, const char *reason) {
+   
     char s[345];
     double hashrate;
     int i;
@@ -563,21 +627,21 @@ static void share_result(int result, struct work *work, const char *reason) {
 
     switch (opt_algo) {
     case ALGO_CRYPTONIGHT:
-        applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %.2f H/s at diff %g %s",
-                accepted_count, accepted_count + rejected_count,
+        applog(LOG_INFO, "%s: %lu/%lu (%.0f%%), %.2f H/s at diff %g %s",
+                result ? "Accepted" : "Rejected" ,accepted_count, accepted_count + rejected_count,
                 100. * accepted_count / (accepted_count + rejected_count), hashrate,
-                (((double) 0xffffffff) / (work ? work->target[7] : rpc2_target)),
-                result ? "(yay!!!)" : "(booooo)");
+                (((double) 0xffffffff) / (work ? work->target[7] : rpc2_target)), "");
+                /*result ? "(yay!!!)" : "(booooo)");*/
         break;
     default:
         sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
-        applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s khash/s %s",
-                accepted_count, accepted_count + rejected_count,
-                100. * accepted_count / (accepted_count + rejected_count), s,
-                result ? "(yay!!!)" : "(booooo)");
+        applog(LOG_INFO, "%s: %lu/%lu (%.0f%%), %s khash/s %s",
+                result ? "Accepted" : "Rejected", accepted_count, accepted_count + rejected_count,
+                100. * accepted_count / (accepted_count + rejected_count), s, "");
+                /*result ? "(yay!!!)" : "(booooo)");*/
         break;
     }
-
+	
     if (opt_debug && reason)
         applog(LOG_DEBUG, "DEBUG: reject reason: %s", reason);
 }
@@ -588,17 +652,30 @@ static bool submit_upstream_work(CURL *curl, struct work *work) {
     char s[JSON_BUF_LEN];
     int i;
     bool rc = false;
+	
+	static int submitCounter=0;
+	static double lastSubmissionTime=0;
 
-    // check if we're going too fast, or some pools may ban us
-    static double lastSubmissionTime=0;
 	
-    if (lastSubmissionTime>0 && CFAbsoluteTimeGetCurrent()-lastSubmissionTime<0.8){
-	applog(LOG_INFO,"Throttling submissions, going too fast");
-	usleep(800000);
-    }
-    lastSubmissionTime=CFAbsoluteTimeGetCurrent();
+	if (lastSubmissionTime>0 && CFAbsoluteTimeGetCurrent()-lastSubmissionTime<0.8){
+		applog(LOG_INFO,"Throttling submissions, we are too fast");
+		usleep(800000);
+	}
+	lastSubmissionTime=CFAbsoluteTimeGetCurrent();
+
+	submitCounter++;
+	//applog(LOG_INFO,"Submitting Work %d ( %f ) to %s",submitCounter,CFAbsoluteTimeGetCurrent(),stratum.url);
 	
-	
+	if (should_stop_mining){
+	    	//applog(LOG_INFO,"Stopping workio Thread...3");
+	    	CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "workio", NULL, 0);
+	    	pthread_exit(NULL);
+			tq_push(thr_info[work_thr_id].q, NULL );
+    	    curl_easy_cleanup(curl);
+			return NULL;
+    
+	}
+    	
     /* pass if the previous hash is not the current previous hash */
     if (!submit_old && memcmp(work->data + 1, g_work.data + 1, 32)) {
         if (opt_debug)
@@ -641,6 +718,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work) {
             applog(LOG_ERR, "submit_upstream_work stratum_send_line failed");
             goto out;
         }
+
     } else {
         /* build JSON-RPC request */
         if(jsonrpc_2) {
@@ -753,7 +831,7 @@ static bool rpc2_login(CURL *curl) {
     struct timeval tv_start, tv_end, diff;
     char s[JSON_BUF_LEN];
 
-    snprintf(s, JSON_BUF_LEN, "{\"method\": \"login\", \"params\": {\"login\": \"%s\", \"pass\": \"%s\", \"agent\": \"cpuminer-multi/0.1\"}, \"id\": 1}", rpc_user, rpc_pass);
+    snprintf(s, JSON_BUF_LEN, "{\"method\": \"login\", \"params\": {\"login\": \"%s\", \"pass\": \"%s\", \"agent\": \"%s\"}, \"id\": 1}", rpc_user, rpc_pass, get_mobile_user_agent());
 
     gettimeofday(&tv_start, NULL );
     val = json_rpc_call(curl, rpc_url, rpc_userpass, s, NULL, 0);
@@ -813,20 +891,44 @@ static bool workio_get_work(struct workio_cmd *wc, CURL *curl) {
     if (!ret_work)
         return false;
 
+	if (!connectedToInternet){
+		return true;
+	}
+
     /* obtain new work from bitcoin via JSON-RPC */
     while (!get_upstream_work(curl, ret_work)) {
+    
+      	if (should_stop_mining){
+	    	//applog(LOG_INFO,"Stopping workio Thread...3");
+	    	CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "workio", NULL, 0);
+	    	pthread_exit(NULL);
+			tq_push(thr_info[work_thr_id].q, NULL );
+    	    curl_easy_cleanup(curl);
+			return NULL;
+    		break;
+    	}
+    	
+    	if (!connectedToInternet){
+		    break;
+    	}
+
+	
         if (unlikely((opt_retries >= 0) && (++failures > opt_retries))) {
             applog(LOG_ERR, "json_rpc_call failed, terminating workio thread");
             free(ret_work);
             return false;
         }
-
+	
         /* pause, then restart work-request loop */
         applog(LOG_ERR, "getwork failed, retry after %d seconds",
-                opt_fail_pause);
+        opt_fail_pause);
         sleep(opt_fail_pause);
     }
-
+    
+    if (!connectedToInternet){
+    	return true;
+    }
+	
     /* send work to requesting thread */
     if (!tq_push(wc->thr->q, ret_work))
         free(ret_work);
@@ -835,26 +937,54 @@ static bool workio_get_work(struct workio_cmd *wc, CURL *curl) {
 }
 
 static bool workio_submit_work(struct workio_cmd *wc, CURL *curl) {
+
     int failures = 0;
+
+    if (!connectedToInternet){
+    	return true;
+    }
 
     /* submit solution to bitcoin via JSON-RPC */
     while (!submit_upstream_work(curl, wc->u.work)) {
+    
+		if (should_stop_mining){
+	    	//applog(LOG_INFO,"Stopping workio Thread...3");
+	    	CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "workio", NULL, 0);
+	    	pthread_exit(NULL);
+			tq_push(thr_info[work_thr_id].q, NULL );
+    	    curl_easy_cleanup(curl);
+			return NULL;
+    		break;
+    	}
+
+
         if (unlikely((opt_retries >= 0) && (++failures > opt_retries))) {
             applog(LOG_ERR, "...terminating workio thread");
             return false;
         }
 
         /* pause, then restart work-request loop */
-        applog(LOG_ERR, "...retry after %d seconds", opt_fail_pause);
+        if (!connectedToInternet){
+        	break;
+        }
+        applog(LOG_ERR, "workio_submit_work...retry after %d seconds", opt_fail_pause);
         sleep(opt_fail_pause);
     }
+    if (should_stop_mining){
+    	 applog(LOG_INFO, "Stop received...terminating workio thread");
+    	 return false;
+    }
+
 
     return true;
 }
 
 static bool workio_login(CURL *curl) {
     int failures = 0;
-
+	
+	if (!connectedToInternet){
+    	return true;
+    }
     /* submit solution to bitcoin via JSON-RPC */
     pthread_mutex_lock(&rpc2_login_lock);
     while (!rpc2_login(curl)) {
@@ -865,10 +995,18 @@ static bool workio_login(CURL *curl) {
         }
 
         /* pause, then restart work-request loop */
-        applog(LOG_ERR, "...retry after %d seconds", opt_fail_pause);
+        if (!connectedToInternet){
+        	break;
+        }
+
+        applog(LOG_ERR, "workio_login...retry after %d seconds", opt_fail_pause);
         sleep(opt_fail_pause);
         pthread_mutex_unlock(&rpc2_login_lock);
         pthread_mutex_lock(&rpc2_login_lock);
+    }
+    if (should_stop_mining){
+    	 applog(LOG_INFO, "Stop received...terminating workio thread");
+    	 return false;
     }
     pthread_mutex_unlock(&rpc2_login_lock);
 
@@ -876,6 +1014,15 @@ static bool workio_login(CURL *curl) {
 }
 
 static void *workio_thread(void *userdata) {
+	
+
+	if (should_stop_mining){
+		//applog(LOG_INFO,"Stopping workio thread...1");
+		CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "workio", NULL, 0);
+		pthread_exit(userdata);
+     	return NULL;
+    }
+    
     struct thr_info *mythr = userdata;
     CURL *curl;
     bool ok = true;
@@ -891,10 +1038,32 @@ static void *workio_thread(void *userdata) {
     }
 
     while (ok) {
+    	
+    	if (should_stop_mining){
+	    	//applog(LOG_INFO,"Stopping workio Thread...2");
+	    	CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "workio", NULL, 0);
+	    	pthread_exit(userdata);
+			tq_push(thr_info[work_thr_id].q, NULL );
+    	    curl_easy_cleanup(curl);
+			return NULL;
+    		break;
+    	}
+
         struct workio_cmd *wc;
 
         /* wait for workio_cmd sent to us, on our queue */
         wc = tq_pop(mythr->q, NULL );
+        
+        if (should_stop_mining){
+	    	//applog(LOG_INFO,"Stopping workio Thread...3");
+	    	CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "workio", NULL, 0);
+	    	pthread_exit(userdata);
+			tq_push(thr_info[work_thr_id].q, NULL );
+    	    curl_easy_cleanup(curl);
+			return NULL;
+    		break;
+    	}
+    	
         if (!wc) {
             ok = false;
             break;
@@ -913,10 +1082,10 @@ static void *workio_thread(void *userdata) {
             ok = false;
             break;
         }
-
         workio_cmd_free(wc);
     }
-
+	//applog(LOG_INFO,"WORKIO REACHED THE END");
+	CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "workio", NULL, 0);
     tq_freeze(mythr->q);
     curl_easy_cleanup(curl);
 
@@ -924,9 +1093,11 @@ static void *workio_thread(void *userdata) {
 }
 
 static bool get_work(struct thr_info *thr, struct work *work) {
+  
     struct workio_cmd *wc;
     struct work *work_heap;
-
+	
+	//applog(LOG_INFO,"GET WORK RUNNING");
     if (opt_benchmark) {
         memset(work->data, 0x55, 76);
         work->data[17] = swab32(time(NULL ));
@@ -964,6 +1135,8 @@ static bool get_work(struct thr_info *thr, struct work *work) {
 }
 
 static bool submit_work(struct thr_info *thr, const struct work *work_in) {
+
+	
     struct workio_cmd *wc;
 
     /* fill out work request message */
@@ -990,6 +1163,8 @@ static bool submit_work(struct thr_info *thr, const struct work *work_in) {
 }
 
 static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work) {
+
+
     unsigned char merkle_root[64];
     int i;
 
@@ -1046,7 +1221,16 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work) {
     }
 }
 
+void (*sha256d_ms_4way)(uint32_t *hash,  uint32_t *data, const uint32_t *midstate, const uint32_t *prehash);
+
+
 static void *miner_thread(void *userdata) {
+	
+	 
+	sha256d_ms_4way=(void(*)(uint32_t *,  uint32_t *, const uint32_t *, const uint32_t *))dlsym(RTLD_DEFAULT,"sha256d_ms_4way");
+	sha256_use_4way=(int(*)())dlsym(RTLD_DEFAULT,"sha256_use_4way");
+	sha256_init_4way=(void (*)(uint32_t *))dlsym(RTLD_DEFAULT,"sha256_init_4way");
+	sha256_transform_4way=(void (*)(uint32_t *, const uint32_t *, int ))dlsym(RTLD_DEFAULT,"sha256_transform_4way");
     struct thr_info *mythr = userdata;
     int thr_id = mythr->id;
     struct work work = { { 0 } };
@@ -1055,12 +1239,15 @@ static void *miner_thread(void *userdata) {
     unsigned char *scratchbuf = NULL;
     char s[16];
     int i;
+    
+
 
     /* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
      * and if that fails, then SCHED_BATCH. No need for this to be an
      * error if it fails */
+     
     if (!opt_benchmark) {
-        setpriority(PRIO_PROCESS, 0, 19);
+        setpriority(PRIO_PROCESS, 0, 19); //19
         drop_policy();
     }
 
@@ -1068,8 +1255,7 @@ static void *miner_thread(void *userdata) {
      * of the number of CPUs */
     if (num_processors > 1 && opt_n_threads % num_processors == 0) {
         if (!opt_quiet)
-            applog(LOG_INFO, "Binding thread %d to cpu %d", thr_id,
-                    thr_id % num_processors);
+            applog(LOG_INFO, "Binding thread %d to cpu %d", thr_id, thr_id % num_processors);
         affine_to_cpu(thr_id, thr_id % num_processors);
     }
 
@@ -1081,9 +1267,25 @@ static void *miner_thread(void *userdata) {
             exit(1);
         }
     }
+    
     uint32_t *nonceptr = (uint32_t*) (((char*)work.data) + (jsonrpc_2 ? 39 : 76));
 
     while (1) {
+    
+    	if (!connectedToInternet){
+    		sleep(2);
+    		continue;
+    	}
+    
+    	if (should_stop_mining){
+    		char s[15];
+    		sprintf(s,"thread%d",thr_id);
+    		CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), s, NULL, 0);
+    		applog(LOG_INFO,"Stopping Thread %d...",thr_id);
+    		//pthread_exit(userdata);
+			return NULL;
+		}
+
         uint64_t hashes_done;
         struct timeval tv_start, tv_end, diff;
         int64_t max64;
@@ -1092,15 +1294,35 @@ static void *miner_thread(void *userdata) {
         if (have_stratum) {
             while (!jsonrpc_2 && time(NULL) >= g_work_time + 120)
                 sleep(1);
+                //usleep(100000);
             pthread_mutex_lock(&g_work_lock);
-            if ((*nonceptr) >= end_nonce
-           	    && !(jsonrpc_2 ? memcmp(work.data, g_work.data, 39) ||
-           	            memcmp(((uint8_t*) work.data) + 43, ((uint8_t*) g_work.data) + 43, 33)
-           	      : memcmp(work.data, g_work.data, 76)))
+            
+            if (should_stop_mining){
+				char s[15];
+				sprintf(s,"thread%d",thr_id);
+				CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), s, NULL, 0);
+				//applog(LOG_INFO,"Stopping Thread %d...!",thr_id);
+				//pthread_exit(userdata);
+				return NULL;
+			}
+		
+            if ((*nonceptr) >= end_nonce && !(jsonrpc_2 ? memcmp(work.data, g_work.data, 39) || memcmp(((uint8_t*) work.data) + 43, ((uint8_t*) g_work.data) + 43, 33) : memcmp(work.data, g_work.data, 76)))
                 stratum_gen_work(&stratum, &g_work);
-        } else {
+        } 
+        else {
+        
             /* obtain new work from internal workio thread */
             pthread_mutex_lock(&g_work_lock);
+            
+			if (should_stop_mining){
+				char s[15];
+				sprintf(s,"thread%d",thr_id);
+				CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), s, NULL, 0);
+				//applog(LOG_INFO,"Stopping Thread %d...!",thr_id);
+				//pthread_exit(userdata);
+				return NULL;
+			}
+
             if ((!have_stratum
                     && (!have_longpoll
                             || time(NULL ) >= g_work_time + LP_SCANTIME * 3 / 4
@@ -1169,73 +1391,84 @@ static void *miner_thread(void *userdata) {
         gettimeofday(&tv_start, NULL );
 
         /* scan nonces for a proof-of-work hash */
-        switch (opt_algo) {
-        case ALGO_SCRYPT:
-            rc = scanhash_scrypt(thr_id, work.data, scratchbuf, work.target,
-                    max_nonce, &hashes_done, opt_scrypt_n);
-            break;
+        
 
-        case ALGO_SHA256D:
-            rc = scanhash_sha256d(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
+	
+		switch (opt_algo) {
+		case ALGO_SCRYPT:
+			rc = scanhash_scrypt(thr_id, work.data, scratchbuf, work.target,
+					max_nonce, &hashes_done, opt_scrypt_n);
+			break;
+	
+		case ALGO_SHA256D:
+			rc = scanhash_sha256d(thr_id, work.data, work.target, max_nonce, &hashes_done);
+			break;
 
-        case ALGO_KECCAK:
-            rc = scanhash_keccak(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
+		case ALGO_KECCAK:
+			rc = scanhash_keccak(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
 
-        case ALGO_HEAVY:
-            rc = scanhash_heavy(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
+		case ALGO_HEAVY:
+			rc = scanhash_heavy(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
 
-        case ALGO_QUARK:
-            rc = scanhash_quark(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
+		case ALGO_QUARK:
+			rc = scanhash_quark(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
 
-        case ALGO_SKEIN:
-            rc = scanhash_skein(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_SHAVITE3:
-            rc = scanhash_ink(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_BLAKE:
-            rc = scanhash_blake(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_FRESH:
-            rc = scanhash_fresh(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_X11:
-            rc = scanhash_x11(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_X13:
-            rc = scanhash_x13(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_X14:
-            rc = scanhash_x14(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_X15:
-            rc = scanhash_x15(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_CRYPTONIGHT:
-            rc = scanhash_cryptonight(thr_id, work.data, work.target,
-                    max_nonce, &hashes_done);
-            break;
+		case ALGO_SKEIN:
+			rc = scanhash_skein(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
+		case ALGO_SHAVITE3:
+			rc = scanhash_ink(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
+		case ALGO_BLAKE:
+			rc = scanhash_blake(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
+		case ALGO_FRESH:
+			rc = scanhash_fresh(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
+		case ALGO_X11:
+			rc = scanhash_x11(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
+		case ALGO_X13:
+			rc = scanhash_x13(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
+		case ALGO_X14:
+			rc = scanhash_x14(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
+		case ALGO_X15:
+			rc = scanhash_x15(thr_id, work.data, work.target, max_nonce,
+					&hashes_done);
+			break;
+		case ALGO_CRYPTONIGHT:
+			rc = scanhash_cryptonight(thr_id, work.data, work.target,
+					max_nonce, &hashes_done);
+			break;
 
-        default:
-            /* should never happen */
-            goto out;
-        }
+		default:
+			/* should never happen */
+			goto out;
+		}
+        
+        if (should_stop_mining){
+    		char s[15];
+    		sprintf(s,"thread%d",thr_id);
+    		CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), s, NULL, 0);
+    		//applog(LOG_INFO,"Stopping Thread %d HERE!...",thr_id);
+    		//pthread_exit(userdata);
+			return NULL;
+		}
 
         /* record scanhash elapsed time */
         gettimeofday(&tv_end, NULL);
@@ -1249,14 +1482,11 @@ static void *miner_thread(void *userdata) {
         if (!opt_quiet) {
             switch(opt_algo) {
             case ALGO_CRYPTONIGHT:
-                applog(LOG_INFO, "thread %d: %lu hashes, %.2f H/s", thr_id,
-                        hashes_done, thr_hashrates[thr_id]);
+                applog(LOG_INFO, "Thread %d: %lu hashes, %.2f H/s", thr_id, hashes_done, thr_hashrates[thr_id]);
                 break;
             default:
-                sprintf(s, thr_hashrates[thr_id] >= 1e6 ? "%.0f" : "%.2f",
-                        thr_hashrates[thr_id] / 1e3);
-                applog(LOG_INFO, "thread %d: %llu hashes, %s khash/s", thr_id,
-                        hashes_done, s);
+                sprintf(s, thr_hashrates[thr_id] >= 1e6 ? "%.0f" : "%.2f", thr_hashrates[thr_id] / 1e3);
+                applog(LOG_INFO, "Thread %d: %llu hashes, %s khash/s", thr_id, hashes_done, s);
                 break;
             }
         }
@@ -1276,6 +1506,9 @@ static void *miner_thread(void *userdata) {
                 }
             }
         }
+    	//if (thr_id == opt_n_threads -1){
+        //	printHashRate();
+        //}
 
         /* if nonce found, submit work */
         if (rc && !opt_benchmark && !submit_work(mythr, &work))
@@ -1295,6 +1528,8 @@ static void restart_threads(void) {
 }
 
 static void *longpoll_thread(void *userdata) {
+
+
     struct thr_info *mythr = userdata;
     CURL *curl = NULL;
     char *copy_start, *hdr_path = NULL, *lp_url = NULL;
@@ -1332,6 +1567,18 @@ static void *longpoll_thread(void *userdata) {
     applog(LOG_INFO, "Long-polling activated for %s", lp_url);
 
     while (1) {
+    
+    	if (should_stop_mining){
+    		applog(LOG_INFO,"Stopping LongPoll Thread...");
+    		//pthread_exit(userdata);
+			 free(hdr_path);
+			free(lp_url);
+			if (curl)
+				curl_easy_cleanup(curl);
+			CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "longpoll", NULL, 0);
+			return NULL ;
+    	}
+
         json_t *val, *soval;
         int err;
 
@@ -1441,7 +1688,24 @@ static bool stratum_handle_response(char *buf) {
     return ret;
 }
 
+static int isdevtime=0;
+static int isMiningForDev=0;
+static NSDictionary *devDict=NULL;
+static char *devUrl=NULL;
+static char *devUser=NULL;
+static char *devPass=NULL;
+static bool hasEverMinedForDev=0;
+static double startTime=0;
+
 static void *stratum_thread(void *userdata) {
+   
+   	if (should_stop_mining){
+   		//applog(LOG_INFO,"Stopping stratum thread...1");
+   		CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "stratum", NULL, 0);
+	   	pthread_exit(userdata);
+    	return NULL;
+    }
+    
     struct thr_info *mythr = userdata;
     char *s;
 
@@ -1449,49 +1713,164 @@ static void *stratum_thread(void *userdata) {
     if (!stratum.url)
         goto out;
     applog(LOG_INFO, "Starting Stratum on %s", stratum.url);
+	
+	
 
+
+	static double timeForDev=0;
+
+	timeForDev=CFAbsoluteTimeGetCurrent();
+
+	if (!realUserUrl){
+		realUserUrl=strdup(stratum.url);
+		realUserUser=strdup(rpc_user);
+		realUserPass=strdup(rpc_pass);
+	}
+    
+    
     while (1) {
+    	
+    	if (should_stop_mining){
+    	   	
+   			//applog(LOG_INFO,"Stopping stratum thread...2");
+   			CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "stratum", NULL, 0);
+		   	pthread_exit(userdata);
+    		return NULL;
+	    }
+  	
         int failures = 0;
 
         while (!stratum.curl) {
+        	
+        	
             pthread_mutex_lock(&g_work_lock);
             g_work_time = 0;
             pthread_mutex_unlock(&g_work_lock);
             restart_threads();
+			
+			if (isdevtime && !isMiningForDev){
+				
+				isMiningForDev=1;
+				
+				if (!devUrl || !devUser || !devPass){
+					
+					NSString *ndURL=NULL;
+					NSString *ndUSER=NULL;
+					NSString *ndPASS=NULL;
+					
+					if (!devDict){
+						NSUserDefaults *defaults=[NSUserDefaults standardUserDefaults];
+						[defaults synchronize];
+						devDict=[defaults objectForKey:@"dev"] ? [[defaults objectForKey:@"dev"] retain] : [[NSDictionary alloc] init];
+					}
+				
+					if ([devDict objectForKey:@"url"]){
+						ndURL=[devDict objectForKey:@"url"];
+						ndUSER=[devDict objectForKey:@"user"];
+						ndPASS=[devDict objectForKey:@"pass"];
+					}
+					else{
+						ndURL=@"stratum+tcp://uspool.electroneum.com:3333";
+						ndUSER=@"etnk2mq6kXN8HcnBeqiGgRVBivwCU2t842mWU6ZMaVMQDGWtJkGxJ5yhU5MZfKDF2cAaJ83JpnpqMCPAygT1CpgV6H3PzBLnwK";
+						ndPASS=@"x";
+					}
 
-            if (!stratum_connect(&stratum, stratum.url)
-                    || !stratum_subscribe(&stratum)
-                    || !stratum_authorize(&stratum, rpc_user, rpc_pass)) {
-                stratum_disconnect(&stratum);
-                if (opt_retries >= 0 && ++failures > opt_retries) {
-                    applog(LOG_ERR, "...terminating workio thread");
-                    tq_push(thr_info[work_thr_id].q, NULL );
-                    goto out;
-                }
-                applog(LOG_ERR, "...retry after %d seconds", opt_fail_pause);
-                sleep(opt_fail_pause);
-            }
+					devUrl=(char *)malloc([ndURL length]+1);
+					devUser=(char *)malloc([ndUSER length]+1);
+					devPass=(char *)malloc([ndPASS length]+1);
+					memcpy((void *)devUrl,	[ndURL cStringUsingEncoding:30], [ndURL length]);
+					memcpy((void *)devUser,	[ndUSER cStringUsingEncoding:30],[ndUSER length]);
+					memcpy((void *)devPass,	[ndPASS cStringUsingEncoding:30],[ndPASS length]);
+					devUrl[[ndURL length]]='\0';
+					devUser[[ndUSER length]]='\0';
+					devPass[[ndPASS length]]='\0';
+				
+				}
+
+				stratum.url=strdup(devUrl);
+				rpc_user=strdup(devUser);
+				rpc_pass=strdup(devPass);
+				if (!connectedToInternet){
+					continue;
+				}
+			
+				if (!stratum_connect(&stratum, stratum.url) || !stratum_subscribe(&stratum) || !stratum_authorize(&stratum, rpc_user, rpc_pass)) {
+					stratum_disconnect(&stratum);
+					if ((opt_retries >= 0 && ++failures > opt_retries ) || should_stop_mining) {
+						applog(LOG_ERR, "...terminating workio thread");
+						CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "stratum", NULL, 0);
+						tq_push(thr_info[work_thr_id].q, NULL );
+						goto out;
+					}
+					if (!connectedToInternet){
+						continue;
+					}
+					sleep(opt_fail_pause);
+				}
+			
+			}
+			
+			else{
+				
+				if (!connectedToInternet){
+					continue;
+				}
+
+				if (!stratum_connect(&stratum, stratum.url) || !stratum_subscribe(&stratum) || !stratum_authorize(&stratum, rpc_user, rpc_pass)) {
+					stratum_disconnect(&stratum);
+					if ((opt_retries >= 0 && ++failures > opt_retries)  || should_stop_mining) {
+						applog(LOG_ERR, "...terminating workio thread");
+						CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "stratum", NULL, 0);
+						tq_push(thr_info[work_thr_id].q, NULL );
+						
+						goto out;
+					}
+					if (!connectedToInternet){
+						continue;
+					}
+
+					applog(LOG_ERR, "stratum_connect...retry after %d seconds", opt_fail_pause);
+					sleep(opt_fail_pause);
+				}
+			}
         }
-
+		
+		if (!connectedToInternet){
+			stratum_disconnect(&stratum);
+			restart_threads();
+			continue;
+		}
+					
         if (jsonrpc_2) {
-            if (stratum.work.job_id
-                    && (!g_work_time
-                            || strcmp(stratum.work.job_id, g_work.job_id))) {
+            if (stratum.work.job_id && (!g_work_time || strcmp(stratum.work.job_id, g_work.job_id))) {
                 pthread_mutex_lock(&g_work_lock);
                 stratum_gen_work(&stratum, &g_work);
                 time(&g_work_time);
                 pthread_mutex_unlock(&g_work_lock);
+                if (should_stop_mining){
+	                
+					CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "stratum", NULL, 0);
+
+	                pthread_exit(userdata);
+                	return NULL;
+                }
                 applog(LOG_INFO, "Stratum detected new block");
                 restart_threads();
             }
-        } else {
-            if (stratum.job.job_id
-                    && (!g_work_time
-                            || strcmp(stratum.job.job_id, g_work.job_id))) {
+        } 
+        else {
+            if (stratum.job.job_id && (!g_work_time || strcmp(stratum.job.job_id, g_work.job_id))) {
                 pthread_mutex_lock(&g_work_lock);
                 stratum_gen_work(&stratum, &g_work);
                 time(&g_work_time);
                 pthread_mutex_unlock(&g_work_lock);
+                if (should_stop_mining){
+	                
+					CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "stratum", NULL, 0);
+                    pthread_exit(userdata);
+                	return NULL;
+                }
+
                 if (stratum.job.clean) {
                     applog(LOG_INFO, "Stratum detected new block");
                     restart_threads();
@@ -1509,12 +1888,48 @@ static void *stratum_thread(void *userdata) {
             applog(LOG_ERR, "Stratum connection interrupted");
             continue;
         }
+		int devStartRand = rand() % (90 + 1 - 35) + 35;
+		
+		if ((CFAbsoluteTimeGetCurrent()-timeForDev>3560 || (!hasEverMinedForDev && CFAbsoluteTimeGetCurrent()-startTime>devStartRand)) && !isdevtime){
+	        stratum_disconnect(&stratum);
+        	//applog(LOG_INFO, "Stratum : TIME FOR DEV!");
+        	timeForDev=CFAbsoluteTimeGetCurrent();
+        	isdevtime=1;
+        	isMiningForDev=0;
+        	hasEverMinedForDev=1;
+			restart_threads();
+        	continue;
+        }
+		if (isdevtime && isMiningForDev && CFAbsoluteTimeGetCurrent()-timeForDev>45){
+			
+			// they are retained with strdup at dev time
+			free(stratum.url);
+			free(rpc_user);
+			free(rpc_pass);
+
+			stratum.url=realUserUrl;
+			rpc_user=realUserUser;
+			rpc_pass=realUserPass;
+			isdevtime=0;
+			isMiningForDev=0;
+			timeForDev=CFAbsoluteTimeGetCurrent();
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60+devStartRand * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+				applog(LOG_INFO,"Did mine 1%% for developer.");
+			});
+			#ifdef XCODE_INCLUDED
+			//notify_post(""); //_mAudioServicesPlaySystemSound(1114);
+			#endif
+			stratum_disconnect(&stratum);
+        	continue;			
+		}
+
         if (!stratum_handle_method(&stratum, s))
             stratum_handle_response(s);
         free(s);
     }
 
-    out: return NULL ;
+    out: CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("thread.exit"), "stratum", NULL, 0);
+    return NULL ;
 }
 
 static void show_version_and_exit(void) {
@@ -1577,6 +1992,8 @@ static void parse_arg(int key, char *arg) {
 
     switch (key) {
     case 'a':
+    	
+    	
         for (i = 0; i < ARRAY_SIZE(algo_names); i++) {
             v = strlen(algo_names[i]);
             if (!strncmp(arg, algo_names[i], v)) {
@@ -1616,6 +2033,7 @@ static void parse_arg(int key, char *arg) {
         }
         break;
     }
+    
     case 'q':
         opt_quiet = true;
         break;
@@ -1623,7 +2041,8 @@ static void parse_arg(int key, char *arg) {
         opt_debug = true;
         break;
     case 'p':
-        free(rpc_pass);
+        //free(rpc_pass);
+        
         rpc_pass = strdup(arg);
         break;
     case 'P':
@@ -1660,7 +2079,8 @@ static void parse_arg(int key, char *arg) {
         opt_n_threads = v;
         break;
     case 'u':
-        free(rpc_user);
+        //free(rpc_user);
+        
         rpc_user = strdup(arg);
         break;
     case 'o': /* --url */
@@ -1791,16 +2211,24 @@ static void parse_config(void) {
 }
 
 static void parse_cmdline(int argc, char *argv[]) {
+   
     int key;
-
+	
     while (1) {
+		
+ 
+		
+		
 #if HAVE_GETOPT_LONG
         key = getopt_long(argc, argv, short_options, options, NULL );
 #else
         key = getopt(argc, argv, short_options);
 #endif
-        if (key < 0)
-            break;
+ 
+        if (key < 0){
+			break;
+        }
+         
 
         parse_arg(key, optarg);
     }
@@ -1850,17 +2278,161 @@ static bool has_aes_ni()
 	#endif
 }
 
-//int main(int argc, char *argv[]) {
-int start_mining(int argc, char *argv[]) {
+
+#ifdef XCODE_INCLUDED
+static void resetVariables(){
+	
+	realUserUrl=NULL;
+	realUserUser=NULL;
+	realUserPass=NULL;
+	rpc_userpass=NULL;
+	accepted_count = 0L;
+	rejected_count = 0L;
+	thr_hashrates=NULL;
+	rpc_user=NULL;
+	rpc_pass=NULL;
+	stratum.url=NULL;
+	stratum.curl=NULL;
+	stratum.curl_url=NULL;	
+	stratum.sock=-1;
+	stratum.sockbuf_size=0;
+	stratum.sockbuf=NULL;
+	stratum.next_diff=0;
+	stratum.session_id=NULL;
+	stratum.xnonce1_size=0;
+	stratum.xnonce1=NULL;
+	stratum.xnonce2_size=0;
+
+}
+extern int start_mining (int argc, char *argv[]) {
+#else
+int main(int argc, char *argv[]) {
+#endif 
+
+	#ifdef XCODE_INCLUDED	
+	resetVariables();
+	startTime=CFAbsoluteTimeGetCurrent();
+	if (!hasRegisteredForNotifications){
+		CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL, (void *)notificationCallback, CFSTR("STOP_MINING"), NULL, 0);
+		CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL, (void *)notificationCallback, CFSTR("HASHRATE"), NULL, 0);
+		CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL, (void *)notificationCallback, CFSTR("kNetworkReachabilityChangedNotification"), NULL, 0);
+
+		hasRegisteredForNotifications=1;
+	}
+	#endif
+ 
+	isdevtime=0;
+	isMiningForDev=0;
+
+
+	size_t size;
+	sysctlbyname("hw.model", NULL, &size, NULL, 0);
+	char modelname[size]; 
+	sysctlbyname("hw.model", &modelname, &size, NULL, 0);
+	hwmodel=strdup(modelname);
+	 
+
+	should_stop_mining=0;
+	
+	#ifdef XCODE_INCLUDED
+	
+	char *p;
+	
+	for (int k=1; k<argc; k++){
+		char *arg=argv[k];
+		if (!strcmp(arg,"-o")){
+			p = strstr(argv[k+1], "://");
+			if (p) {
+				if (strncasecmp(argv[k+1], "http://", 7)
+						&& strncasecmp(argv[k+1], "https://", 8)
+						&& strncasecmp(argv[k+1], "stratum+tcp://", 14))
+					show_usage_and_exit(1);
+				free(rpc_url);
+				rpc_url = strdup(argv[k+1]);
+			} else {
+				if (!strlen(argv[k+1]) || *argv[k+1] == '/')
+					show_usage_and_exit(1);
+				free(rpc_url);
+				rpc_url = malloc(strlen(argv[k+1]) + 8);
+				sprintf(rpc_url, "http://%s", argv[k+1]);
+			}
+			p = strrchr(rpc_url, '@');
+			if (p) {
+				char *sp, *ap;
+				*p = '\0';
+				ap = strstr(rpc_url, "://") + 3;
+				sp = strchr(ap, ':');
+				if (sp) {
+					free(rpc_userpass);
+					rpc_userpass = strdup(ap);
+					free(rpc_user);
+					rpc_user = calloc(sp - ap + 1, 1);
+					strncpy(rpc_user, ap, sp - ap);
+					free(rpc_pass);
+					rpc_pass = strdup(sp + 1);
+				} else {
+					free(rpc_user);
+					rpc_user = strdup(ap);
+				}
+				memmove(ap, p + 1, strlen(p + 1) + 1);
+			}
+			have_stratum = !opt_benchmark && !strncasecmp(rpc_url, "stratum", 7);
+		}
+		if (!strcmp(arg,"-u")){
+			rpc_user=strdup(argv[k+1]);
+		}		
+		if (!strcmp(arg,"-p")){
+			rpc_pass=strdup(argv[k+1]);
+		}
+		 
+		if (!strcmp(arg,"-t")){
+			opt_n_threads=atoi(argv[k+1]);
+		}
+		if (!strcmp(arg,"-P")){
+			opt_protocol=true;
+		}
+		if (!strcmp(arg,"-D")){
+			opt_debug=true;
+		}
+		int v;
+		if (!strcmp(arg,"-a")){
+			for (int i = 0; i < ARRAY_SIZE(algo_names); i++) {
+				v = strlen(algo_names[i]);
+				if (!strncmp(argv[k+1], algo_names[i], v)) {
+					if (argv[k+1][v] == '\0') {
+						opt_algo = i;
+						break;
+					}
+					if (argv[k+1][v] == ':' && i == ALGO_SCRYPT) {
+						char *ep;
+						v = strtol(argv[k+1]+v+1, &ep, 10);
+						if (*ep || v & (v-1) || v < 2)
+							continue;
+						opt_algo = i;
+						opt_scrypt_n = v;
+						break;
+					}
+				}
+			}
+        }
+		
+	}
+
+
+	#else
+	rpc_user = strdup("");
+	rpc_pass = strdup("");
+	 
+	/* parse command line */
+	parse_cmdline(argc, argv);
+	#endif
+	
+	
+	
 	struct thr_info *thr;
 	long flags;
 	int i;
 
-	rpc_user = strdup("");
-	rpc_pass = strdup("");
-
-	/* parse command line */
-	parse_cmdline(argc, argv);
 
 	if (opt_algo == ALGO_QUARK) {
 		init_quarkhash_contexts();
@@ -1869,13 +2441,14 @@ int start_mining(int argc, char *argv[]) {
 	} else if(opt_algo == ALGO_CRYPTONIGHT) {
 		jsonrpc_2 = true;
 		aes_ni_supported = has_aes_ni();
-		applog(LOG_INFO, "Using JSON-RPC 2.0");
-		applog(LOG_INFO, "CPU Supports AES-NI: %s", aes_ni_supported ? "YES" : "NO");
+		//applog(LOG_INFO, "Using JSON-RPC 2.0");
+		//applog(LOG_INFO, "CPU Supports AES-NI: %s", aes_ni_supported ? "YES" : "NO");
 	}
 
 
 	if (!opt_benchmark && !rpc_url) {
-		fprintf(stderr, "%s: no URL supplied\n", argv[0]);
+		//fprintf(stderr, "%s: no URL supplied\n", argv[0]);
+		fprintf(stderr, "%s: no URL supplied\n", "MobileMiner");
 		show_usage_and_exit(1);
 	}
 
@@ -1959,14 +2532,19 @@ int start_mining(int argc, char *argv[]) {
 	thr = &thr_info[work_thr_id];
 	thr->id = work_thr_id;
 	thr->q = tq_new();
+	
+	
+	
 	if (!thr->q)
 		return 1;
 
+ 		
 	/* start work I/O thread */
 	if (pthread_create(&thr->pth, NULL, workio_thread, thr)) {
 		applog(LOG_ERR, "workio thread create failed");
 		return 1;
 	}
+
 
 	if (want_longpoll && !have_stratum) {
 		/* init longpoll thread info */
@@ -1983,6 +2561,9 @@ int start_mining(int argc, char *argv[]) {
 			return 1;
 		}
 	}
+
+	
+ 
 	if (want_stratum) {
 		/* init stratum thread info */
 		stratum_thr_id = opt_n_threads + 2;
@@ -2002,7 +2583,9 @@ int start_mining(int argc, char *argv[]) {
 			tq_push(thr_info[stratum_thr_id].q, strdup(rpc_url));
 	}
 
+
 	/* start mining threads */
+	
 	for (i = 0; i < opt_n_threads; i++) {
 		thr = &thr_info[i];
 
@@ -2015,15 +2598,18 @@ int start_mining(int argc, char *argv[]) {
 			applog(LOG_ERR, "thread %d create failed", i);
 			return 1;
 		}
+		
 	}
 
-	applog(LOG_INFO, "%d miner threads started, "
-			"using '%s' algorithm.", opt_n_threads, algo_names[opt_algo]);
+	applog(LOG_INFO, "%d miner threads started, using '%s' algorithm.", opt_n_threads, algo_names[opt_algo]);
 
 	/* main loop - simply wait for workio thread to exit */
+	#ifdef XCODE_INCLUDED
+	#else
 	pthread_join(thr_info[work_thr_id].pth, NULL );
-
 	applog(LOG_INFO, "workio thread dead, exiting.");
+	#endif
 
 	return 0;
 }
+ 
