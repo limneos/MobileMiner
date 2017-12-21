@@ -82,8 +82,10 @@ void applog(int prio, const char *fmt, ...)
 		len = vsnprintf(NULL, 0, fmt, ap2) + 1;
 		va_end(ap2);
 		buf = alloca(len);
-		if (vsnprintf(buf, len, fmt, ap) >= 0)
+		if (vsnprintf(buf, len, fmt, ap) >= 0){
 			syslog(prio, "%s", buf);
+			CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(), CFSTR("message"), (const void *)buf, NULL, 1);
+		}
 	}
 #else
 	if (0) {}
