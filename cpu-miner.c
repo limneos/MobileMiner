@@ -2021,7 +2021,9 @@ int start_mining(int argc, char *argv[]) {
 			"using '%s' algorithm.", opt_n_threads, algo_names[opt_algo]);
 
 	/* main loop - simply wait for workio thread to exit */
-	pthread_join(thr_info[work_thr_id].pth, NULL );
+	
+	/* Removed - Don't block the main thread if used as a library */
+	//pthread_join(thr_info[work_thr_id].pth, NULL );
 
 	applog(LOG_INFO, "workio thread dead, exiting.");
 
