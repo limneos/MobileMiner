@@ -34,6 +34,18 @@ if you want to keep the same argument formatting and parsing.
 
 6) In the case of the program being loaded as a library, flags need to be set inside threads in order to be able to stop them, because we don't want them to exit the main thread when done (although its faster to kill and restart the app if you're caught in a processing miner thread)
 
+# Dependencies
+
+Jansson
+https://github.com/akheron/jansson
+
+curl for iOS
+https://github.com/sinofool/build-libcurl-ios
+
+openssl for iOS
+https://github.com/x2on/OpenSSL-for-iPhone
+
+
 
 # Instructions
 
