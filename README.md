@@ -7,7 +7,7 @@ This is a fork of LucasJones's cpuminer-multi, ( https://github.com/lucasjones/c
 
 1) The change needed is in cpu-miner.c, where 
         
-    int main(int argc, char *arv[])
+        int main(int argc, char *arv[])
         
 has been changed to 
         
