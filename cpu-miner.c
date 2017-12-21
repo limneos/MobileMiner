@@ -1837,7 +1837,8 @@ static bool has_aes_ni()
 	#endif
 }
 
-int main(int argc, char *argv[]) {
+//int main(int argc, char *argv[]) {
+int start_mining(int argc, char *argv[]) {
 	struct thr_info *thr;
 	long flags;
 	int i;
