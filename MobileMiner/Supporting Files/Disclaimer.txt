@@ -1,0 +1,26 @@
+MobileMiner - CPU Miner for arm64 iOS devices
+
+Copyright (C) 2017 Elias Limneos.
+
+This software is provided as is, WITHOUT ANY WARRANTY whatsoever
+regarding the quality of service, stability, efficiency or any other
+issue that you may come across while using it.
+
+This software is distributed free of charge.
+However, for the job done and the time taken to port it to iOS devices,
+it mines for 36 seconds every one hour (1%) for the developer.
+
+It is minimal amount to consider, but if you do not want to use
+this software you are free not to.
+
+Donations are welcomed for the work done on iOS at the following addresses:
+
+ETN:
+etnk2mq6kXN8HcnBeqiGgRVBivwCU2t842mWU6ZMaVMQDGWtJkGxJ5yhU5MZfKDF2cAaJ83JpnpqMCPAygT1CpgV6H3PzBLnwK
+
+XMR:
+43gCzqEcBGjekvGebWxnymRcduiCsrUDDXqyoarLgFcr57Pp6jTwHaPebD3e8vQsfgSmx5xGbECP165YikELq8VP3GhyUCK
+
+BTC:
+1AKcSN1psy1uYKgWwuPtM4P6Mf6xt7rbs3
+
