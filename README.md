@@ -63,6 +63,7 @@ https://github.com/x2on/OpenSSL-for-iPhone
 - Compile openssl for iOS and drag libcrypto.a in Xcode project
 - Compile jansson for iOS and drag libjansson.a to Xcode project
 - Compile Curl for iOS and drag libcurl.a to Xcode project
+- (If you're having problems compiling or prefer precompiled binaries of the cpuminer project and dependencies , I am alternatively including them in Precompiled Binaries folder, just drag them in the Xcode project.)
         
         Other Flags: -all_load 
 
